@@ -1,0 +1,476 @@
+#!/bin/bash
+
+set -e
+
+FONTS_DIR="$HOME/.local/share/fonts"
+BACKUP_DIR="$HOME/.config/om-custom-font/backups"
+
+OMARCHY_DEFAULT_FONT="JetBrainsMono Nerd Font"
+GNOME_DEFAULT_FONT="Adwaita Sans 11"
+GNOME_DEFAULT_MONO="Adwaita Mono 11"
+
+usage() {
+  cat <<EOF
+om-custom-font - Install custom fonts with full Omarchy integration
+
+Usage:
+  om-custom-font set <path> [options]        Install font and set as default
+  om-custom-font add <path>                  Install font without setting as default
+  om-custom-font reset-all                   Reset to Omarchy defaults
+  om-custom-font revert-gnome                Restore previous GNOME/GTK font settings
+  om-custom-font current                     Show current font across all systems
+  om-custom-font help                        Show this help
+
+Arguments:
+  <path>    Can be either:
+            - A single .ttf/.otf file (variable fonts work fully, traditional
+              fonts will use synthetic bold/italic)
+            - A directory containing font files (installs all, picks common family)
+
+Options for 'set':
+  --gnome             Update both GTK font-name and monospace-font-name
+  --gnome-font        Update only GTK font-name (UI elements)
+  --gnome-mono        Update only GTK monospace-font-name (code/terminal in GTK apps)
+  --gnome-size=N      Set GNOME font size (default: 11) [EXPERIMENTAL]
+
+  Each --gnome* flag creates a timestamped backup before changing settings.
+  Use 'revert-gnome' to restore from any previous backup.
+
+Examples:
+  om-custom-font add ~/Downloads/CascadiaCode.ttf        # just install
+  om-custom-font set ~/Downloads/CascadiaCode.ttf        # install + set default
+  om-custom-font set ~/MyFontFamily/                      # directory with family
+  om-custom-font set ~/Downloads/Font.ttf --gnome --gnome-size=12
+  om-custom-font reset-all                               # back to Omarchy defaults
+  om-custom-font revert-gnome
+EOF
+}
+
+get_font_family() {
+  local ttf_file="$1"
+  fc-query -f '%{family[0]}\n' "$ttf_file" | head -n1
+}
+
+# Get font info (styles) from fc-scan - caches result to avoid repeated calls
+# Returns: style count and comma-separated style list
+get_font_info() {
+  local ttf_file="$1"
+  local scan_output
+  scan_output=$(fc-scan "$ttf_file" 2>/dev/null)
+
+  local style_count
+  style_count=$(echo "$scan_output" | grep -c "style:" || echo "0")
+
+  local styles
+  styles=$(echo "$scan_output" | awk -F'"' '/style:/{printf "%s%s", sep, $2; sep=", "}')
+
+  echo "$style_count|$styles"
+}
+
+backup_gnome_settings() {
+  mkdir -p "$BACKUP_DIR"
+  local timestamp
+  timestamp=$(date +%Y%m%d-%H%M%S)
+  local backup_file="$BACKUP_DIR/$timestamp"
+
+  {
+    echo "timestamp=$timestamp"
+    echo "font-name=$(gsettings get org.gnome.desktop.interface font-name)"
+    echo "monospace-font-name=$(gsettings get org.gnome.desktop.interface monospace-font-name)"
+  } > "$backup_file"
+  echo "Backed up GNOME font settings to $backup_file"
+}
+
+set_gnome_font() {
+  local font_name="$1"
+  local size="${2:-11}"
+  gsettings set org.gnome.desktop.interface font-name "$font_name $size"
+  echo "Set GNOME/GTK font-name to: $font_name $size"
+}
+
+set_gnome_mono() {
+  local font_name="$1"
+  local size="${2:-11}"
+  gsettings set org.gnome.desktop.interface monospace-font-name "$font_name $size"
+  echo "Set GNOME/GTK monospace-font-name to: $font_name $size"
+}
+
+revert_gnome() {
+  if [[ ! -d "$BACKUP_DIR" ]] || [[ -z "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
+    echo "Error: No backups found in $BACKUP_DIR"
+    echo "Run 'om-custom-font set <file> --gnome' first to create a backup."
+    exit 1
+  fi
+
+  # List available backups
+  echo "Available backups:"
+  echo ""
+
+  local backups=()
+  local i=1
+  while IFS= read -r backup_file; do
+    backups+=("$backup_file")
+    local ts font mono
+    ts=$(basename "$backup_file")
+    font=$(grep "^font-name=" "$backup_file" | cut -d= -f2-)
+    mono=$(grep "^monospace-font-name=" "$backup_file" | cut -d= -f2-)
+    printf "  %d) %s\n" "$i" "$ts"
+    printf "     font-name: %s\n" "$font"
+    printf "     monospace: %s\n" "$mono"
+    echo ""
+    i=$((i + 1))
+  done < <(ls -1t "$BACKUP_DIR"/*)
+
+  read -rp "Select backup to restore (1-$((i-1))) or 'q' to quit: " choice
+
+  if [[ "$choice" == "q" ]]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt $((i-1)) ]]; then
+    echo "Invalid selection."
+    exit 1
+  fi
+
+  local selected="${backups[$((choice-1))]}"
+
+  # Source the backup file
+  local font_name monospace_font_name
+  font_name=$(grep "^font-name=" "$selected" | cut -d= -f2-)
+  monospace_font_name=$(grep "^monospace-font-name=" "$selected" | cut -d= -f2-)
+
+  # Remove surrounding quotes from gsettings output
+  font_name="${font_name//\'/}"
+  monospace_font_name="${monospace_font_name//\'/}"
+
+  echo ""
+  echo "Restoring from $(basename "$selected")..."
+  gsettings set org.gnome.desktop.interface font-name "$font_name"
+  gsettings set org.gnome.desktop.interface monospace-font-name "$monospace_font_name"
+
+  echo "Reverted GNOME font settings:"
+  echo "  font-name: $font_name"
+  echo "  monospace-font-name: $monospace_font_name"
+}
+
+show_current() {
+  echo "=== Current font settings ==="
+  echo ""
+  echo "Omarchy (waybar):     $(omarchy-font-current)"
+  echo "Ghostty:              $(grep -oP 'font-family = "\K[^"]+' ~/.config/ghostty/config 2>/dev/null || echo 'not set')"
+  echo "Fontconfig monospace: $(xmlstarlet sel -t -v '//match[test/string="monospace"]/edit/string' ~/.config/fontconfig/fonts.conf 2>/dev/null || echo 'not set')"
+
+  # Single gsettings call for both values
+  local gnome_settings
+  gnome_settings=$(gsettings list-recursively org.gnome.desktop.interface 2>/dev/null)
+  echo "GNOME font-name:      $(echo "$gnome_settings" | awk '$2=="font-name"{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+  echo "GNOME monospace:      $(echo "$gnome_settings" | awk '$2=="monospace-font-name"{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+}
+
+cmd_set() {
+  install_and_apply "$@"
+}
+
+cmd_add() {
+  install_and_apply --add-only "$@"
+}
+
+cmd_reset_all() {
+  echo "Resetting to Omarchy defaults..."
+  echo ""
+
+  # Remove custom fonts from user directory
+  local custom_fonts
+  shopt -s nullglob
+  custom_fonts=("$FONTS_DIR"/*.ttf "$FONTS_DIR"/*.otf "$FONTS_DIR"/*.TTF "$FONTS_DIR"/*.OTF)
+  shopt -u nullglob
+
+  if [[ ${#custom_fonts[@]} -gt 0 ]]; then
+    local removed=0
+    echo "Removing custom font file(s) from $FONTS_DIR:"
+    for f in "${custom_fonts[@]}"; do
+      # Skip omarchy system font
+      if [[ "$(basename "$f")" == "omarchy.ttf" ]]; then
+        continue
+      fi
+      echo "  Removing: $(basename "$f")"
+      rm -f "$f"
+      removed=$((removed + 1))
+    done
+    if [[ $removed -eq 0 ]]; then
+      echo "  (no custom fonts to remove)"
+    fi
+    echo ""
+    echo "Updating font cache..."
+    fc-cache -f
+    echo ""
+  fi
+
+  # Reset Omarchy font
+  echo "Setting Omarchy font to: $OMARCHY_DEFAULT_FONT"
+  omarchy-font-set "$OMARCHY_DEFAULT_FONT" >/dev/null 2>&1
+
+  # Reset GNOME settings
+  echo "Setting GNOME font-name to: $GNOME_DEFAULT_FONT"
+  gsettings set org.gnome.desktop.interface font-name "$GNOME_DEFAULT_FONT"
+
+  echo "Setting GNOME monospace to: $GNOME_DEFAULT_MONO"
+  gsettings set org.gnome.desktop.interface monospace-font-name "$GNOME_DEFAULT_MONO"
+
+  echo ""
+  echo "Done! Reset to Omarchy defaults."
+  echo ""
+  show_current
+}
+
+install_and_apply() {
+  local font_path=""
+  local do_gnome_font=false
+  local do_gnome_mono=false
+  local gnome_size="11"
+  local add_only=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --add-only)
+        add_only=true
+        shift
+        ;;
+      --gnome)
+        do_gnome_font=true
+        do_gnome_mono=true
+        shift
+        ;;
+      --gnome-font)
+        do_gnome_font=true
+        shift
+        ;;
+      --gnome-mono)
+        do_gnome_mono=true
+        shift
+        ;;
+      --gnome-size=*)
+        gnome_size="${1#*=}"
+        shift
+        ;;
+      *)
+        font_path="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$font_path" ]]; then
+    echo "Error: No font file or directory specified"
+    usage
+    exit 1
+  fi
+
+  local font_family=""
+  local installed_count=0
+
+  mkdir -p "$FONTS_DIR"
+
+  if [[ -d "$font_path" ]]; then
+    # Directory mode: install all font files
+    echo "Directory detected: $font_path"
+    echo ""
+
+    # Single pass: collect families and counts using associative array
+    declare -A family_counts
+    local families=()
+
+    shopt -s nullglob
+    for f in "$font_path"/*.ttf "$font_path"/*.otf "$font_path"/*.TTF "$font_path"/*.OTF; do
+      [[ -f "$f" ]] || continue
+
+      local fam
+      fam=$(get_font_family "$f")
+      if [[ -n "$fam" ]]; then
+        # Track count per family
+        if [[ -z "${family_counts[$fam]:-}" ]]; then
+          family_counts[$fam]=0
+          families+=("$fam")
+        fi
+        family_counts[$fam]=$((family_counts[$fam] + 1))
+      fi
+
+      cp "$f" "$FONTS_DIR/"
+      echo "  Installed: $(basename "$f")"
+      installed_count=$((installed_count + 1))
+    done
+    shopt -u nullglob
+
+    if [[ $installed_count -eq 0 ]]; then
+      echo "Error: No .ttf or .otf files found in $font_path"
+      exit 1
+    fi
+
+    echo ""
+    echo "Installed $installed_count font files."
+
+    # Handle multiple families
+    if [[ ${#families[@]} -eq 1 ]]; then
+      font_family="${families[0]}"
+      echo "Font family: $font_family"
+    elif [[ ${#families[@]} -gt 1 ]]; then
+      echo ""
+      echo "Multiple font families found:"
+      local i=1
+      for fam in "${families[@]}"; do
+        printf "  %d) %s (%d files)\n" "$i" "$fam" "${family_counts[$fam]}"
+        i=$((i + 1))
+      done
+      echo ""
+      read -rp "Select family to set as default (1-${#families[@]}): " choice
+
+      if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#families[@]} ]]; then
+        echo "Invalid selection. Using first family."
+        font_family="${families[0]}"
+      else
+        font_family="${families[$((choice-1))]}"
+      fi
+    fi
+
+  elif [[ -f "$font_path" ]]; then
+    # Single file mode
+    local ttf_file="$font_path"
+
+    font_family=$(get_font_family "$ttf_file")
+    if [[ -z "$font_family" ]]; then
+      echo "Error: Could not determine font family from $ttf_file"
+      exit 1
+    fi
+
+    echo "Font family detected: $font_family"
+
+    # Check if it's a variable font (single fc-scan call for both count and styles)
+    local font_info style_count styles
+    font_info=$(get_font_info "$ttf_file")
+    style_count="${font_info%%|*}"
+    styles="${font_info#*|}"
+
+    if [[ "$style_count" -gt 1 ]]; then
+      echo "Variable font detected with styles: $styles"
+      echo ""
+    else
+      # Traditional single-weight font - check if there are siblings
+      local dir sibling_count
+      dir=$(dirname "$ttf_file")
+
+      # Count siblings in one pass (only spawn fc-query for files that exist)
+      sibling_count=0
+      shopt -s nullglob
+      for f in "$dir"/*.ttf "$dir"/*.otf "$dir"/*.TTF "$dir"/*.OTF; do
+        [[ -f "$f" ]] || continue
+        if [[ "$(get_font_family "$f")" == "$font_family" ]]; then
+          sibling_count=$((sibling_count + 1))
+        fi
+      done
+      shopt -u nullglob
+
+      if [[ "$sibling_count" -gt 1 ]]; then
+        echo ""
+        echo "Warning: This is a traditional (non-variable) font file."
+        echo "         Found $sibling_count files for '$font_family' in the same directory."
+        echo "         Bold/italic will be synthesized (may look poor)."
+        echo ""
+        echo "Tip: Run with the directory instead to install the full family:"
+        echo "     om-custom-font set \"$dir\""
+        echo ""
+        read -rp "Continue with single file anyway? [y/N] " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+          echo "Cancelled."
+          exit 0
+        fi
+      else
+        echo ""
+        echo "Note: Single font file. Bold/italic will be synthesized by the renderer."
+      fi
+    fi
+
+    cp "$ttf_file" "$FONTS_DIR/"
+    echo "Installed $(basename "$ttf_file") to $FONTS_DIR/"
+    installed_count=1
+
+  else
+    echo "Error: Path not found: $font_path"
+    exit 1
+  fi
+
+  # Update font cache
+  echo ""
+  echo "Updating font cache..."
+  fc-cache -f
+
+  # Verify font is now available
+  if ! fc-list "$font_family" 2>/dev/null | grep -q .; then
+    echo "Warning: Font may not have installed correctly. Check fc-list output."
+  fi
+
+  if $add_only; then
+    echo ""
+    echo "Done! Font '$font_family' added to system."
+    echo "It will now appear in the Omarchy font menu (Style > Font)."
+    return
+  fi
+
+  # Call omarchy-font-set
+  echo "Setting Omarchy font..."
+  omarchy-font-set "$font_family" >/dev/null 2>&1
+
+  # Handle GNOME/GTK settings
+  if $do_gnome_font || $do_gnome_mono; then
+    # Warn about non-default size
+    if [[ "$gnome_size" != "11" ]]; then
+      echo ""
+      echo "Warning: Using non-default GNOME font size ($gnome_size)."
+      echo "         This is EXPERIMENTAL and may cause display issues."
+      echo "         Use 'om-custom-font reset-all' to restore defaults if needed."
+      echo ""
+    fi
+
+    backup_gnome_settings
+    if $do_gnome_font; then
+      set_gnome_font "$font_family" "$gnome_size"
+    fi
+    if $do_gnome_mono; then
+      set_gnome_mono "$font_family" "$gnome_size"
+    fi
+  else
+    echo ""
+    echo "Tip: Add --gnome, --gnome-font, or --gnome-mono to also update GTK app fonts"
+  fi
+
+  echo ""
+  echo "Done! Font '$font_family' is now set."
+}
+
+# Main command dispatch
+case "${1:-}" in
+  set)
+    shift
+    cmd_set "$@"
+    ;;
+  add)
+    shift
+    cmd_add "$@"
+    ;;
+  reset-all)
+    cmd_reset_all
+    ;;
+  revert-gnome)
+    revert_gnome
+    ;;
+  current)
+    show_current
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
