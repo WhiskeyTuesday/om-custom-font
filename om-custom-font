@@ -5,13 +5,17 @@ set -e
 FONTS_DIR="$HOME/.local/share/fonts"
 BACKUP_DIR="$HOME/.config/om-custom-font/backups"
 
+# Omarchy 4 owns the monospace default in /etc/fonts/conf.d/50-omarchy.conf and
+# writes the *user* override at ~/.config/fontconfig/fonts.conf from
+# omarchy-font-set. We never write that file ourselves — we only ever call
+# omarchy-font-set and, on reset, remove the override so the packaged default
+# takes over again.
+FONTCONFIG_USER="$HOME/.config/fontconfig/fonts.conf"
 OMARCHY_DEFAULT_FONT="JetBrainsMono Nerd Font"
-GNOME_DEFAULT_FONT="Adwaita Sans 11"
-GNOME_DEFAULT_MONO="Adwaita Mono 11"
 
 usage() {
   cat <<EOF
-om-custom-font - Install custom fonts with full Omarchy integration
+om-custom-font - Install custom fonts with full Omarchy 4 integration
 
 Usage:
   om-custom-font set <path> [options]        Install font and set as default
@@ -31,19 +35,53 @@ Options for 'set':
   --gnome             Update both GTK font-name and monospace-font-name
   --gnome-font        Update only GTK font-name (UI elements)
   --gnome-mono        Update only GTK monospace-font-name (code/terminal in GTK apps)
-  --gnome-size=N      Set GNOME font size (default: 11) [EXPERIMENTAL]
+  --gnome-size=N      Override the GNOME point size (default: keep current)
+                      [DISCOURAGED - see "Font size" below]
 
   Each --gnome* flag creates a timestamped backup before changing settings.
   Use 'revert-gnome' to restore from any previous backup.
 
+Font size:
+  This tool sets font FAMILY only. Omarchy 4 owns font SIZE through a single
+  knob that moves the shell, GTK, and terminals together:
+
+    omarchy display text size          # show current
+    omarchy display text size 16       # set (9-20 px)
+    omarchy display text size reset    # back to 12px / 1.0 / 9pt
+
+  --gnome-size changes the GTK point size directly, which fights that knob
+  (it rescales text-scaling-factor against the GTK point size). Prefer
+  'omarchy display text size'.
+
 Examples:
   om-custom-font add ~/Downloads/CascadiaCode.ttf        # just install
   om-custom-font set ~/Downloads/CascadiaCode.ttf        # install + set default
-  om-custom-font set ~/MyFontFamily/                      # directory with family
-  om-custom-font set ~/Downloads/Font.ttf --gnome --gnome-size=12
+  om-custom-font set ~/MyFontFamily/                     # directory with family
+  om-custom-font set ~/Downloads/Font.ttf --gnome
   om-custom-font reset-all                               # back to Omarchy defaults
   om-custom-font revert-gnome
 EOF
+}
+
+require_omarchy() {
+  if ! command -v omarchy-font-set >/dev/null 2>&1; then
+    echo "Error: omarchy-font-set not found. This tool requires Omarchy." >&2
+    exit 1
+  fi
+
+  # Omarchy 4 replaced waybar/walker/swayosd/hyprlock with the Quickshell-based
+  # omarchy shell and moved the tree to /usr/share/omarchy. Warn (don't block)
+  # if we're clearly on an older layout.
+  local version=""
+  [[ -r /usr/share/omarchy/version ]] && version=$(< /usr/share/omarchy/version)
+  if [[ -z "$version" ]]; then
+    echo "Warning: could not read /usr/share/omarchy/version."
+    echo "         This version of om-custom-font targets Omarchy 4."
+    echo ""
+  elif [[ "${version%%.*}" -lt 4 ]] 2>/dev/null; then
+    echo "Warning: detected Omarchy $version. This tool targets Omarchy 4."
+    echo ""
+  fi
 }
 
 get_font_family() {
@@ -67,6 +105,26 @@ get_font_info() {
   echo "$style_count|$styles"
 }
 
+# `omarchy font list` is `fc-list :spacing=100`, so a proportional family is
+# settable but will never show up in the Omarchy font menu.
+is_monospace_family() {
+  local family="$1"
+  fc-list :spacing=100 -f '%{family[0]}\n' 2>/dev/null | grep -Fxq "$family"
+}
+
+# Current point size from a gsettings font string ("Adwaita Sans 11" -> 11).
+gnome_current_size() {
+  local key="$1" name pt
+  name=$(gsettings get org.gnome.desktop.interface "$key" 2>/dev/null) || return 0
+  name="${name//\'/}"
+  pt="${name##* }"
+  if [[ "$pt" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "$pt"
+  else
+    echo "11"
+  fi
+}
+
 backup_gnome_settings() {
   mkdir -p "$BACKUP_DIR"
   local timestamp
@@ -77,20 +135,21 @@ backup_gnome_settings() {
     echo "timestamp=$timestamp"
     echo "font-name=$(gsettings get org.gnome.desktop.interface font-name)"
     echo "monospace-font-name=$(gsettings get org.gnome.desktop.interface monospace-font-name)"
+    echo "text-scaling-factor=$(gsettings get org.gnome.desktop.interface text-scaling-factor)"
   } > "$backup_file"
   echo "Backed up GNOME font settings to $backup_file"
 }
 
 set_gnome_font() {
   local font_name="$1"
-  local size="${2:-11}"
+  local size="$2"
   gsettings set org.gnome.desktop.interface font-name "$font_name $size"
   echo "Set GNOME/GTK font-name to: $font_name $size"
 }
 
 set_gnome_mono() {
   local font_name="$1"
-  local size="${2:-11}"
+  local size="$2"
   gsettings set org.gnome.desktop.interface monospace-font-name "$font_name $size"
   echo "Set GNOME/GTK monospace-font-name to: $font_name $size"
 }
@@ -135,10 +194,10 @@ revert_gnome() {
 
   local selected="${backups[$((choice-1))]}"
 
-  # Source the backup file
-  local font_name monospace_font_name
+  local font_name monospace_font_name scaling
   font_name=$(grep "^font-name=" "$selected" | cut -d= -f2-)
   monospace_font_name=$(grep "^monospace-font-name=" "$selected" | cut -d= -f2-)
+  scaling=$(grep "^text-scaling-factor=" "$selected" | cut -d= -f2-)
 
   # Remove surrounding quotes from gsettings output
   font_name="${font_name//\'/}"
@@ -152,20 +211,92 @@ revert_gnome() {
   echo "Reverted GNOME font settings:"
   echo "  font-name: $font_name"
   echo "  monospace-font-name: $monospace_font_name"
+
+  # Older backups predate text-scaling-factor; only restore it when recorded.
+  if [[ -n "$scaling" ]]; then
+    gsettings set org.gnome.desktop.interface text-scaling-factor "$scaling"
+    echo "  text-scaling-factor: $scaling"
+  fi
+}
+
+# Family named by the user's fontconfig override, if any.
+fontconfig_override_family() {
+  [[ -f "$FONTCONFIG_USER" ]] || return 0
+  grep -A2 'name="family"' "$FONTCONFIG_USER" 2>/dev/null |
+    grep -oP '<string>\K[^<]+' | tail -1
+}
+
+# Omarchy 3 wrote a full fonts.conf using mode="assign". On Omarchy 4 the
+# package-owned /etc/fonts/conf.d/50-omarchy.conf already assigns monospace, so
+# a stale assign-style user rule never matches and is silently ignored — the
+# terminals and GTK show the custom font while `fc-match monospace` still
+# resolves to the Omarchy default. Omarchy 4 uses prepend_first, which wins.
+fontconfig_override_is_stale() {
+  [[ -f "$FONTCONFIG_USER" ]] || return 1
+  ! grep -q 'mode="prepend_first"' "$FONTCONFIG_USER" 2>/dev/null
+}
+
+terminal_font_line() {
+  local label="$1" file="$2" pattern="$3"
+  [[ -f "$file" ]] || return 0
+  printf "  %-22s %s\n" "$label" "$(grep -oP "$pattern" "$file" 2>/dev/null | head -1 || echo 'not set')"
 }
 
 show_current() {
-  echo "=== Current font settings ==="
+  echo "=== Monospace (fontconfig) ==="
   echo ""
-  echo "Omarchy (waybar):     $(omarchy-font-current)"
-  echo "Ghostty:              $(grep -oP 'font-family = "\K[^"]+' ~/.config/ghostty/config 2>/dev/null || echo 'not set')"
-  echo "Fontconfig monospace: $(xmlstarlet sel -t -v '//match[test/string="monospace"]/edit/string' ~/.config/fontconfig/fonts.conf 2>/dev/null || echo 'not set')"
+  local resolved override
+  resolved=$(omarchy-font-current 2>/dev/null || echo 'unknown')
+  override=$(fontconfig_override_family)
 
-  # Single gsettings call for both values
+  printf "  %-22s %s\n" "Resolved:" "$resolved"
+  if [[ -z "$override" ]]; then
+    printf "  %-22s %s\n" "User override:" "none (using /etc/fonts/conf.d/50-omarchy.conf)"
+  elif fontconfig_override_is_stale; then
+    printf "  %-22s %s\n" "User override:" "$override  [STALE - Omarchy 3 format]"
+    echo ""
+    echo "  Warning: $FONTCONFIG_USER predates Omarchy 4 and is being ignored."
+    echo "           Fix it by re-applying the font:"
+    echo "             omarchy font set \"$override\""
+    echo "           or reset with: om-custom-font reset-all"
+  else
+    printf "  %-22s %s\n" "User override:" "$override"
+    if [[ "$override" != "$resolved" ]]; then
+      echo ""
+      echo "  Warning: override does not match the resolved font."
+      echo "           Run 'fc-cache -f' or re-apply with 'omarchy font set'."
+    fi
+  fi
+
+  echo ""
+  echo "=== Terminals ==="
+  echo ""
+  terminal_font_line "Ghostty:"   ~/.config/ghostty/config         'font-family = "\K[^"]+'
+  terminal_font_line "Alacritty:" ~/.config/alacritty/alacritty.toml 'family = "\K[^"]+'
+  terminal_font_line "Kitty:"     ~/.config/kitty/kitty.conf       '^font_family \K.+'
+  terminal_font_line "Foot:"      ~/.config/foot/foot.ini          '^font=\K[^:]+'
+
+  echo ""
+  echo "=== GNOME/GTK ==="
+  echo ""
+  # Single gsettings call for all values
   local gnome_settings
   gnome_settings=$(gsettings list-recursively org.gnome.desktop.interface 2>/dev/null)
-  echo "GNOME font-name:      $(echo "$gnome_settings" | awk '$2=="font-name"{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
-  echo "GNOME monospace:      $(echo "$gnome_settings" | awk '$2=="monospace-font-name"{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+  printf "  %-22s %s\n" "font-name:" \
+    "$(echo "$gnome_settings" | awk '$2=="font-name"{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+  printf "  %-22s %s\n" "monospace-font-name:" \
+    "$(echo "$gnome_settings" | awk '$2=="monospace-font-name"{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+  printf "  %-22s %s\n" "text-scaling-factor:" \
+    "$(echo "$gnome_settings" | awk '$2=="text-scaling-factor"{print $3}')"
+
+  echo ""
+  echo "=== Text size (omarchy display text size) ==="
+  echo ""
+  if command -v omarchy-display-text-size >/dev/null 2>&1; then
+    omarchy-display-text-size | sed 's/^/  /'
+  else
+    echo "  omarchy-display-text-size not available"
+  fi
 }
 
 cmd_set() {
@@ -190,7 +321,8 @@ cmd_reset_all() {
     local removed=0
     echo "Removing custom font file(s) from $FONTS_DIR:"
     for f in "${custom_fonts[@]}"; do
-      # Skip omarchy system font
+      # Omarchy 4 ships its icon font at /usr/share/fonts/omarchy/omarchy.ttf,
+      # but Omarchy 3 installs left a copy here. Never remove it either way.
       if [[ "$(basename "$f")" == "omarchy.ttf" ]]; then
         continue
       fi
@@ -207,28 +339,48 @@ cmd_reset_all() {
     echo ""
   fi
 
-  # Reset Omarchy font
+  # Point every consumer (terminals, fontconfig, shell) back at the default,
+  # then drop the user override entirely so the packaged default owns it again.
   echo "Setting Omarchy font to: $OMARCHY_DEFAULT_FONT"
-  omarchy-font-set "$OMARCHY_DEFAULT_FONT" >/dev/null 2>&1
+  apply_omarchy_font "$OMARCHY_DEFAULT_FONT"
 
-  # Reset GNOME settings
-  echo "Setting GNOME font-name to: $GNOME_DEFAULT_FONT"
-  gsettings set org.gnome.desktop.interface font-name "$GNOME_DEFAULT_FONT"
+  if [[ -f "$FONTCONFIG_USER" ]]; then
+    echo "Removing user fontconfig override: $FONTCONFIG_USER"
+    rm -f "$FONTCONFIG_USER"
+    command -v omarchy-restart-shell >/dev/null 2>&1 && omarchy-restart-shell >/dev/null 2>&1 || true
+  fi
 
-  echo "Setting GNOME monospace to: $GNOME_DEFAULT_MONO"
-  gsettings set org.gnome.desktop.interface monospace-font-name "$GNOME_DEFAULT_MONO"
+  # Reset GNOME settings to their schema defaults rather than hardcoding
+  # values — Omarchy 4 never sets these itself.
+  echo "Resetting GNOME font-name and monospace-font-name to schema defaults"
+  gsettings reset org.gnome.desktop.interface font-name
+  gsettings reset org.gnome.desktop.interface monospace-font-name
 
   echo ""
   echo "Done! Reset to Omarchy defaults."
   echo ""
+  echo "Note: text size is separate. To reset it too:"
+  echo "      omarchy display text size reset"
+  echo ""
   show_current
+}
+
+# omarchy-font-set prints its errors on stdout and pgrep noise along with them,
+# so capture and only surface output when it actually fails.
+apply_omarchy_font() {
+  local family="$1" out
+  if ! out=$(omarchy-font-set "$family" 2>&1); then
+    echo "Error: omarchy-font-set failed:" >&2
+    echo "$out" >&2
+    exit 1
+  fi
 }
 
 install_and_apply() {
   local font_path=""
   local do_gnome_font=false
   local do_gnome_mono=false
-  local gnome_size="11"
+  local gnome_size=""
   local add_only=false
 
   while [[ $# -gt 0 ]]; do
@@ -409,34 +561,44 @@ install_and_apply() {
     echo "Warning: Font may not have installed correctly. Check fc-list output."
   fi
 
+  if ! is_monospace_family "$font_family"; then
+    echo ""
+    echo "Note: '$font_family' is not a monospace family, so it will not appear"
+    echo "      in 'omarchy font list' (which filters on fc-list :spacing=100)."
+    echo "      It can still be set explicitly, and works fine for GTK UI text."
+  fi
+
   if $add_only; then
     echo ""
     echo "Done! Font '$font_family' added to system."
-    echo "It will now appear in the Omarchy font menu (Style > Font)."
+    if is_monospace_family "$font_family"; then
+      echo "It will now appear in 'omarchy font list' and the Omarchy font menu."
+    fi
     return
   fi
 
-  # Call omarchy-font-set
+  # omarchy-font-set updates the terminals, rewrites the user fontconfig
+  # override, restarts the omarchy shell, and fires the `font-set` hook.
   echo "Setting Omarchy font..."
-  omarchy-font-set "$font_family" >/dev/null 2>&1
+  apply_omarchy_font "$font_family"
 
   # Handle GNOME/GTK settings
   if $do_gnome_font || $do_gnome_mono; then
-    # Warn about non-default size
-    if [[ "$gnome_size" != "11" ]]; then
+    if [[ -n "$gnome_size" ]]; then
       echo ""
-      echo "Warning: Using non-default GNOME font size ($gnome_size)."
-      echo "         This is EXPERIMENTAL and may cause display issues."
-      echo "         Use 'om-custom-font reset-all' to restore defaults if needed."
+      echo "Warning: --gnome-size changes the GTK point size directly."
+      echo "         Omarchy 4 derives text-scaling-factor from that point size,"
+      echo "         so this can desync 'omarchy display text size'."
+      echo "         Prefer: omarchy display text size <9-20>"
       echo ""
     fi
 
     backup_gnome_settings
     if $do_gnome_font; then
-      set_gnome_font "$font_family" "$gnome_size"
+      set_gnome_font "$font_family" "${gnome_size:-$(gnome_current_size font-name)}"
     fi
     if $do_gnome_mono; then
-      set_gnome_mono "$font_family" "$gnome_size"
+      set_gnome_mono "$font_family" "${gnome_size:-$(gnome_current_size monospace-font-name)}"
     fi
   else
     echo ""
@@ -445,19 +607,24 @@ install_and_apply() {
 
   echo ""
   echo "Done! Font '$font_family' is now set."
+  echo ""
+  echo "Note: Ghostty and Foot need a restart to pick up a family change."
 }
 
 # Main command dispatch
 case "${1:-}" in
   set)
+    require_omarchy
     shift
     cmd_set "$@"
     ;;
   add)
+    require_omarchy
     shift
     cmd_add "$@"
     ;;
   reset-all)
+    require_omarchy
     cmd_reset_all
     ;;
   revert-gnome)
