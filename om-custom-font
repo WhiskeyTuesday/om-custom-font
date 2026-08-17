@@ -35,23 +35,17 @@ Options for 'set':
   --gnome             Update both GTK font-name and monospace-font-name
   --gnome-font        Update only GTK font-name (UI elements)
   --gnome-mono        Update only GTK monospace-font-name (code/terminal in GTK apps)
-  --gnome-size=N      Override the GNOME point size (default: keep current)
-                      [DISCOURAGED - see "Font size" below]
 
-  Each --gnome* flag creates a timestamped backup before changing settings.
-  Use 'revert-gnome' to restore from any previous backup.
+  The --gnome* flags change the font FAMILY only; the existing point size is
+  kept. Each creates a timestamped backup first — use 'revert-gnome' to restore.
 
 Font size:
-  This tool sets font FAMILY only. Omarchy 4 owns font SIZE through a single
-  knob that moves the shell, GTK, and terminals together:
+  This tool never sets font size. Omarchy 4 owns it through a single knob that
+  moves the shell, GTK, and terminals together:
 
     omarchy display text size          # show current
     omarchy display text size 16       # set (9-20 px)
     omarchy display text size reset    # back to 12px / 1.0 / 9pt
-
-  --gnome-size changes the GTK point size directly, which fights that knob
-  (it rescales text-scaling-factor against the GTK point size). Prefer
-  'omarchy display text size'.
 
 Examples:
   om-custom-font add ~/Downloads/CascadiaCode.ttf        # just install
@@ -135,7 +129,6 @@ backup_gnome_settings() {
     echo "timestamp=$timestamp"
     echo "font-name=$(gsettings get org.gnome.desktop.interface font-name)"
     echo "monospace-font-name=$(gsettings get org.gnome.desktop.interface monospace-font-name)"
-    echo "text-scaling-factor=$(gsettings get org.gnome.desktop.interface text-scaling-factor)"
   } > "$backup_file"
   echo "Backed up GNOME font settings to $backup_file"
 }
@@ -194,10 +187,9 @@ revert_gnome() {
 
   local selected="${backups[$((choice-1))]}"
 
-  local font_name monospace_font_name scaling
+  local font_name monospace_font_name
   font_name=$(grep "^font-name=" "$selected" | cut -d= -f2-)
   monospace_font_name=$(grep "^monospace-font-name=" "$selected" | cut -d= -f2-)
-  scaling=$(grep "^text-scaling-factor=" "$selected" | cut -d= -f2-)
 
   # Remove surrounding quotes from gsettings output
   font_name="${font_name//\'/}"
@@ -212,11 +204,10 @@ revert_gnome() {
   echo "  font-name: $font_name"
   echo "  monospace-font-name: $monospace_font_name"
 
-  # Older backups predate text-scaling-factor; only restore it when recorded.
-  if [[ -n "$scaling" ]]; then
-    gsettings set org.gnome.desktop.interface text-scaling-factor "$scaling"
-    echo "  text-scaling-factor: $scaling"
-  fi
+  # text-scaling-factor is deliberately not restored: it is one third of
+  # omarchy-display-text-size's three-way knob (shell base-size / GTK factor /
+  # terminal pt). Restoring it alone would desync the other two. Use
+  # 'omarchy display text size' to change size.
 }
 
 # Family named by the user's fontconfig override, if any.
@@ -380,7 +371,6 @@ install_and_apply() {
   local font_path=""
   local do_gnome_font=false
   local do_gnome_mono=false
-  local gnome_size=""
   local add_only=false
 
   while [[ $# -gt 0 ]]; do
@@ -403,8 +393,9 @@ install_and_apply() {
         shift
         ;;
       --gnome-size=*)
-        gnome_size="${1#*=}"
-        shift
+        echo "Error: --gnome-size was removed." >&2
+        echo "       Omarchy 4 owns font size: omarchy display text size <9-20>" >&2
+        exit 1
         ;;
       *)
         font_path="$1"
@@ -584,21 +575,15 @@ install_and_apply() {
 
   # Handle GNOME/GTK settings
   if $do_gnome_font || $do_gnome_mono; then
-    if [[ -n "$gnome_size" ]]; then
-      echo ""
-      echo "Warning: --gnome-size changes the GTK point size directly."
-      echo "         Omarchy 4 derives text-scaling-factor from that point size,"
-      echo "         so this can desync 'omarchy display text size'."
-      echo "         Prefer: omarchy display text size <9-20>"
-      echo ""
-    fi
-
+    # Family only. The point size is carried over untouched because
+    # omarchy-display-text-size quantizes text-scaling-factor against the
+    # font-name point size — writing it here would desync that knob.
     backup_gnome_settings
     if $do_gnome_font; then
-      set_gnome_font "$font_family" "${gnome_size:-$(gnome_current_size font-name)}"
+      set_gnome_font "$font_family" "$(gnome_current_size font-name)"
     fi
     if $do_gnome_mono; then
-      set_gnome_mono "$font_family" "${gnome_size:-$(gnome_current_size monospace-font-name)}"
+      set_gnome_mono "$font_family" "$(gnome_current_size monospace-font-name)"
     fi
   else
     echo ""

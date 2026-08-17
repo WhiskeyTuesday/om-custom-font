@@ -1,21 +1,63 @@
 # om-custom-font
 
-Custom font installer for [Omarchy](https://omarchy.org/) with full system integration.
+Install font **files** on [Omarchy](https://omarchy.org/) 4 and wire them into the
+system properly.
 
-**Targets Omarchy 4 ("Quattro").** Omarchy 4 replaced Waybar, Walker, Mako, SwayOSD,
-hyprlock, hypridle, swaybg, and polkit-gnome with a single Quickshell-based
-*omarchy shell*, and moved font resolution to fontconfig as the single source of
-truth. Earlier releases of this tool targeted Omarchy 3 and no longer apply.
+## Why this exists
 
-## Features
+Omarchy handles fonts well, as long as the font is packaged. It does not handle
+font files:
 
-- Install fonts from a single file or a directory (full family)
-- Automatic detection of variable fonts vs traditional font families
-- Sets the font system-wide by delegating to `omarchy-font-set` (fontconfig, terminals, shell, hooks)
-- Optional GNOME/GTK integration for GTK apps, **preserving the current point size**
-- Timestamped backups for GNOME settings with a restore menu
-- Detects a stale Omarchy 3 fontconfig override that Omarchy 4 silently ignores
-- Reset to Omarchy defaults with one command
+| You have | Omarchy's answer |
+|---|---|
+| A font already installed | `omarchy font set "Family"` — works, any family, not a fixed list |
+| A font in the repos or AUR | `omarchy install font <display-name> <package> <family>` |
+| One of six curated Nerd Fonts | Menu → Install → Style → Font |
+| **A `.ttf`/`.otf` on disk** | **nothing** |
+
+That last row is the gap. A font you bought, downloaded from a foundry, built
+yourself, or that simply isn't packaged has no path in. There's nothing wrong
+with Omarchy's design here — it just assumes a package manager, and some fonts
+don't come that way.
+
+To be clear about what is *not* a gap: `omarchy font list` is
+`fc-list :spacing=100`, so it's fully dynamic — once a font is installed by any
+means it shows up and is selectable. And `omarchy install font` is a general
+command, not a fixed menu; the curated list of six is only the GUI shortcut, and
+you can add your own rows to `~/.config/omarchy/extensions/omarchy-menu.jsonc`.
+
+## Is this tool worth it?
+
+The manual equivalent is genuinely short:
+
+```bash
+cp Font.ttf ~/.local/share/fonts/ && fc-cache -f && omarchy font set "Family Name"
+```
+
+If that's all you need, do that. `omarchy-font-set` accepts any installed family,
+so it works fine.
+
+What the tool adds is the parts that are fiddly rather than long:
+
+- **Family-name detection** via `fc-query` — the name is rarely the filename
+  (`CascadiaCode.ttf` → `CaskaydiaMono Nerd Font`), and `omarchy font set` fails
+  on a wrong guess.
+- **Variable vs. traditional detection** — warns before you install one file of a
+  nine-file family and get synthetic bold for the next six months.
+- **Whole-directory installs** with family disambiguation when an archive
+  contains several.
+- **The GTK side** — `monospace-font-name` is a separate setting from
+  fontconfig's `monospace` alias, and Omarchy 4 doesn't set it.
+- **A reset path** back to stock, including the stale-config check below.
+- **A stale Omarchy 3 fontconfig override detector** — see below; this one is a
+  real silent failure.
+
+## Targets Omarchy 4
+
+Omarchy 4 ("Quattro") replaced Waybar, Walker, Mako, SwayOSD, hyprlock, hypridle,
+swaybg, and polkit-gnome with a single Quickshell-based *omarchy shell*, and made
+fontconfig the single source of truth for font resolution. Earlier releases of
+this tool targeted Omarchy 3 and no longer apply.
 
 ## Installation
 
@@ -70,10 +112,16 @@ The knob is anchored at 12px:
 | 14 | 14 | ~1.18 | 11 |
 | 16 | 16 | ~1.36 | 12 |
 
-`--gnome-size=N` is still accepted but **discouraged**: `omarchy-display-text-size`
+`om-custom-font` never writes a size. The `--gnome*` flags swap the *family* and
+carry the existing point size over untouched, because `omarchy-display-text-size`
 computes `text-scaling-factor` by quantizing against the GTK `font-name` point
-size, so changing that point size directly desyncs the knob. By default this tool
-now *preserves* whatever point size is already set and only swaps the family.
+size — writing that point size directly desyncs the knob.
+
+`--gnome-size=N` existed in earlier versions and now errors out with a pointer to
+`omarchy display text size`. `revert-gnome` likewise restores only the two family
+settings; it deliberately does **not** restore `text-scaling-factor`, since
+putting back one third of a three-way knob is what causes the desync described
+below.
 
 ### Known: text size looks unsynchronised with terminals
 
@@ -166,8 +214,12 @@ Omarchy runs Hyprland, not GNOME, but GTK apps still read fonts from gsettings:
 - File dialogs (open/save)
 - GTK-based applications
 
-Use `--gnome`, `--gnome-font`, or `--gnome-mono` to update these. Each creates a
-timestamped backup (including `text-scaling-factor`) that you can restore with
+GTK's `monospace-font-name` is a *separate* setting from fontconfig's `monospace`
+alias — without these flags your GTK text views stay on `Adwaita Mono` while
+everything else follows the font you set.
+
+Use `--gnome`, `--gnome-font`, or `--gnome-mono` to update them. Each creates a
+timestamped backup of the two family settings that you can restore with
 `revert-gnome`. Omarchy 4 does not set these keys itself, so `reset-all` uses
 `gsettings reset` to return them to their schema defaults (`Adwaita Sans 11` /
 `Adwaita Mono 11`).
@@ -178,12 +230,12 @@ timestamped backup (including `text-scaling-factor`) that you can restore with
 omarchy font list                  # available monospace fonts
 omarchy font current               # fc-match monospace
 omarchy font set <name>            # apply a family
-omarchy install font <display-name> <package> <family>   # install a Nerd Font *package*
+omarchy install font <display-name> <package> <family>   # install any font *package*
 omarchy display text size [n]      # the size knob
 ```
 
-For fonts packaged in the repos or AUR, `omarchy install font` is simpler than
-this tool — `om-custom-font` is for font files you have on disk.
+If your font is packaged, use `omarchy install font` — it's the blessed path and
+it keeps the font under the package manager, which this tool cannot do.
 
 ## Requirements
 

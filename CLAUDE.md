@@ -2,12 +2,25 @@
 
 ## What this is
 
-`om-custom-font` is a single Bash script (`./om-custom-font`, ~600 lines, no build
-step, no tests) that installs font files from disk and wires the family into
-Omarchy. It is a **thin, opinionated wrapper around `omarchy-font-set`** plus the
-GTK/gsettings side that Omarchy deliberately does not manage.
+`om-custom-font` is a single Bash script (`./om-custom-font`, ~630 lines, no build
+step, no tests) that installs font **files** from disk and wires the family into
+Omarchy. It is a **thin wrapper around `omarchy-font-set`** plus the GTK/gsettings
+side that Omarchy deliberately does not manage.
 
-The repo is: `om-custom-font` (the script), `README.md`, `LICENSE`. That's it.
+The repo is: `om-custom-font` (the script), `README.md`, `CLAUDE.md`, `LICENSE`.
+
+### The scope boundary — don't blur it
+
+Omarchy already covers packaged fonts (`omarchy install font <name> <pkg>
+<family>`, a general command) and switching (`omarchy font list` is
+`fc-list :spacing=100`, fully dynamic — *not* a fixed list; the six-font menu in
+`omarchy-menu.jsonc` is only a GUI shortcut). The single uncovered case is a
+`.ttf`/`.otf` sitting on disk that isn't packaged. That is this tool's entire
+reason to exist.
+
+So: do not add package installation, font downloading, or font-menu management.
+If a change would be better served by `omarchy install font`, it doesn't belong
+here. The README says this plainly and should keep saying it.
 
 ## Targets Omarchy 4
 
@@ -30,11 +43,18 @@ leftover and is a bug.
    `omarchy-font-set` and, on `reset-all`, deletes the override so the
    package-owned `/etc/fonts/conf.d/50-omarchy.conf` takes over again.
 
-2. **Family is ours; size is Omarchy's.**
+2. **Family is ours; size is Omarchy's. This tool writes no size, ever.**
    `omarchy-display-text-size` (a.k.a. `omarchy display text size`) is the single
-   knob for shell `[font] base-size`, GTK `text-scaling-factor`, and terminal pt.
-   Do not add size logic here. `--gnome-size` exists only as an escape hatch and
-   warns. Default behavior preserves the current GTK point size.
+   knob for shell `[font] base-size`, GTK `text-scaling-factor`, and terminal pt,
+   and it quantizes the GTK factor against the `font-name` point size — so
+   writing that point size here corrupts Omarchy's own math.
+
+   Concretely: `--gnome-size` was removed (the flag now errors with a pointer),
+   the `--gnome*` flags carry the existing pt over via `gnome_current_size()`,
+   and `revert-gnome` restores only `font-name` / `monospace-font-name` — never
+   `text-scaling-factor`, because restoring one third of a three-way knob is what
+   produces the desync. Reading `text-scaling-factor` in `current` is fine;
+   writing it is not. **Do not re-add a size flag.**
 
 3. **Never edit `/usr/share/omarchy/`.** Reading it is the primary way to learn
    what changed; `omarchy update` overwrites any local edit.
